@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -23,6 +25,7 @@ import (
 	"sdr-flight-tracker/internal/adsb"
 	"sdr-flight-tracker/internal/aircraft"
 	"sdr-flight-tracker/internal/location"
+	"sdr-flight-tracker/internal/tracking"
 )
 
 const bellSound = "/usr/share/sounds/freedesktop/stereo/bell.oga"
@@ -30,8 +33,18 @@ const homeAddress = "Tottkällevägen 4A, Värmdö"
 const homeLatitude = 59.323316
 const homeLongitude = 18.480349
 
+const aircraftExpiry = 5 * time.Minute
+const cprExpiry = 30 * time.Second
+const trackGap = 2 * time.Minute
+const maximumPositionJumpMeters = 100_000.0
+const maximumGroundSpeedKnots = 1_500.0
+const minimumAllowedGroundSpeedKnots = 600.0
+const positionErrorAllowanceMeters = 1_000.0
+
 var soundLookup sync.Once
 var soundPlayer string
+var aircraftPhotoAPIBaseURL = "https://api.planespotters.net/pub/photos/hex/"
+var aircraftImageHTTPClient = http.DefaultClient
 var flightMu sync.RWMutex
 var liveFlights = map[string]adsb.Message{}
 var receiverPosition = struct {
@@ -50,6 +63,7 @@ type options struct {
 	input       string
 	latitude    float64
 	longitude   float64
+	trackingDir string
 }
 
 func main() {
@@ -66,6 +80,7 @@ func main() {
 	flag.StringVar(&opts.input, "input", "", "read rtl_adsb text from a file, or - for stdin")
 	flag.Float64Var(&opts.latitude, "lat", homeLatitude, "receiver latitude")
 	flag.Float64Var(&opts.longitude, "lon", homeLongitude, "receiver longitude")
+	flag.StringVar(&opts.trackingDir, "tracking-dir", "tracking-data", "directory for per-aircraft JSON tracking logs; empty disables logging")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -89,24 +104,36 @@ func main() {
 		log.Printf("receiver position latitude=%.5f longitude=%.5f (%s)", opts.latitude, opts.longitude, locationName)
 	}
 	receiverPosition.Latitude, receiverPosition.Longitude = opts.latitude, opts.longitude
-	go serveWeb()
+	trackRecorder, err := tracking.NewRecorder(opts.trackingDir)
+	if err != nil {
+		log.Fatalf("create tracking recorder: %v", err)
+	}
+	if opts.trackingDir != "" {
+		log.Printf("tracking data directory=%s", opts.trackingDir)
+	}
+	defer func() {
+		if err := trackRecorder.Close(); err != nil {
+			log.Printf("close tracking recorder: %v", err)
+		}
+	}()
+	go serveWeb(trackRecorder)
 
-	if err := run(ctx, opts); err != nil && !errors.Is(err, context.Canceled) {
+	if err := run(ctx, opts, trackRecorder); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatalf("flight tracker: %v", err)
 	}
 }
 
-func run(ctx context.Context, opts options) error {
+func run(ctx context.Context, opts options, trackRecorder *tracking.Recorder) error {
 	if opts.input != "" {
 		if opts.input == "-" {
-			return consume(os.Stdin, opts.mute, opts)
+			return consume(os.Stdin, opts.mute, opts, trackRecorder)
 		}
 		f, err := os.Open(opts.input)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
-		return consume(f, opts.mute, opts)
+		return consume(f, opts.mute, opts, trackRecorder)
 	}
 
 	path, err := exec.LookPath("rtl_adsb")
@@ -135,7 +162,7 @@ func run(ctx context.Context, opts options) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("could not start rtl_adsb; check USB permissions and that the dongle is connected: %w", err)
 	}
-	scanErr := consume(stdout, opts.mute, opts)
+	scanErr := consume(stdout, opts.mute, opts, trackRecorder)
 	waitErr := cmd.Wait()
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -149,8 +176,7 @@ func run(ctx context.Context, opts options) error {
 	return waitErr
 }
 
-func consume(r io.Reader, mute bool, opts options) error {
-	flights := make(map[string]adsb.Message)
+func consume(r io.Reader, mute bool, opts options, trackRecorder *tracking.Recorder) error {
 	cpr := make(map[string][2]*cprValue)
 	metadataClient := aircraft.NewClient(opts.metadataURL)
 	scanner := bufio.NewScanner(r)
@@ -161,6 +187,9 @@ func consume(r io.Reader, mute bool, opts options) error {
 		if err != nil {
 			continue
 		}
+		now := time.Now()
+		message.LastSeen = now
+		expireCPR(cpr, now)
 		if opts.metadata {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			var lookupErr error
@@ -171,26 +200,47 @@ func consume(r io.Reader, mute bool, opts options) error {
 			cancel()
 		}
 		if message.TypeCode >= 9 && message.TypeCode <= 18 {
-			updateCPR(&message, cpr)
+			updateCPR(&message, cpr, now)
 		}
 		// The ASCII bell is handled by most terminal emulators as a short beep.
 		// It is emitted only after CRC validation, so radio noise stays silent.
 		beep(mute)
-		previous, exists := flights[message.ICAO]
+		flightMu.Lock()
+		previous, exists := liveFlights[message.ICAO]
+		decodedMessage := message
+		evaluation := positionEvaluation{decision: "not_decoded"}
+		if message.Latitude != nil {
+			evaluation = evaluatePosition(previous, message)
+		}
 		if exists {
+			if message.Latitude != nil && !evaluation.accepted {
+				log.Printf("position rejected for aircraft=%s latitude=%.5f longitude=%.5f reason=%s distance=%.0fm implied_speed=%.0fkt allowed_speed=%.0fkt", message.ICAO, *message.Latitude, *message.Longitude, evaluation.reason, evaluation.distanceMeters, evaluation.impliedSpeedKnots, evaluation.allowedSpeedKnots)
+				message.Latitude, message.Longitude = nil, nil
+				message.PositionTime = time.Time{}
+			}
 			message = merge(previous, message)
 		}
-		flights[message.ICAO] = message
-		flightMu.Lock()
-		liveFlights = flights
+		liveFlights[message.ICAO] = message
+		expireFlights(liveFlights, now)
 		flightMu.Unlock()
+		if err := trackRecorder.Record(makeTrackingEntry(now, decodedMessage, previous, exists, message, evaluation, cpr[message.ICAO])); err != nil {
+			log.Printf("write tracking data for aircraft=%s: %v", message.ICAO, err)
+		}
 		log.Printf("%s", message)
 	}
 	return scanner.Err()
 }
 
-func serveWeb() {
-	http.Handle("/", http.FileServer(http.Dir("web")))
+func serveWeb(trackRecorder *tracking.Recorder) {
+	http.HandleFunc("/aircraft-image", serveAircraftImage)
+	http.HandleFunc("/tracking/map-position", func(w http.ResponseWriter, r *http.Request) {
+		recordMapPosition(w, r, trackRecorder)
+	})
+	webFiles := http.FileServer(http.Dir("web"))
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		webFiles.ServeHTTP(w, r)
+	})
 	http.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -201,14 +251,15 @@ func serveWeb() {
 			return
 		}
 		for {
-			flightMu.RLock()
+			flightMu.Lock()
+			expireFlights(liveFlights, time.Now())
 			aircraftList := make([]webAircraft, 0, len(liveFlights))
 			for _, flight := range liveFlights {
 				aircraftList = append(aircraftList, toWebAircraft(flight))
 			}
 			payload := map[string]any{"receiver": receiverPosition, "aircraft": aircraftList}
 			data, _ := json.Marshal(payload)
-			flightMu.RUnlock()
+			flightMu.Unlock()
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 			select {
@@ -224,26 +275,165 @@ func serveWeb() {
 	}
 }
 
+type mapPositionRequest struct {
+	ICAO             string             `json:"icao"`
+	SetAt            time.Time          `json:"setAt"`
+	Latitude         float64            `json:"latitude"`
+	Longitude        float64            `json:"longitude"`
+	AltitudeFeet     float64            `json:"altitudeFeet"`
+	Cartesian        tracking.Cartesian `json:"cartesianEcefMeters"`
+	CPRReference     string             `json:"cprReference"`
+	BrowserSessionID string             `json:"browserSessionId"`
+}
+
+func recordMapPosition(w http.ResponseWriter, r *http.Request, recorder *tracking.Recorder) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
+	var position mapPositionRequest
+	if err := json.NewDecoder(r.Body).Decode(&position); err != nil {
+		http.Error(w, "invalid map position", http.StatusBadRequest)
+		return
+	}
+	position.ICAO = strings.ToUpper(strings.TrimSpace(position.ICAO))
+	if len(position.ICAO) != 6 || position.SetAt.IsZero() || position.Latitude < -90 || position.Latitude > 90 || position.Longitude < -180 || position.Longitude > 180 || !finite(position.AltitudeFeet, position.Cartesian.X, position.Cartesian.Y, position.Cartesian.Z) || (position.CPRReference != "even" && position.CPRReference != "odd") {
+		http.Error(w, "invalid map position", http.StatusBadRequest)
+		return
+	}
+	entry := tracking.Entry{
+		Event:            "map_position_set",
+		ReceivedAt:       time.Now(),
+		ICAO:             position.ICAO,
+		PositionDecision: "set_in_3d_world",
+		CPRReference:     position.CPRReference,
+		WorldPosition: &tracking.WorldPosition{
+			SetAt:            position.SetAt,
+			Latitude:         position.Latitude,
+			Longitude:        position.Longitude,
+			AltitudeFeet:     position.AltitudeFeet,
+			Cartesian:        position.Cartesian,
+			CPRReference:     position.CPRReference,
+			BrowserSessionID: position.BrowserSessionID,
+		},
+	}
+	if err := recorder.Record(entry); err != nil {
+		log.Printf("write 3D map position for aircraft=%s: %v", position.ICAO, err)
+		http.Error(w, "could not record map position", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func finite(values ...float64) bool {
+	for _, value := range values {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return false
+		}
+	}
+	return true
+}
+
+func serveAircraftImage(w http.ResponseWriter, r *http.Request) {
+	icao := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("hex")))
+	if len(icao) != 6 {
+		http.Error(w, "invalid aircraft address", http.StatusBadRequest)
+		return
+	}
+	if _, err := hex.DecodeString(icao); err != nil {
+		http.Error(w, "invalid aircraft address", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, aircraftPhotoAPIBaseURL+icao, nil)
+	if err != nil {
+		http.Error(w, "aircraft image unavailable", http.StatusBadGateway)
+		return
+	}
+	request.Header.Set("User-Agent", "SDR-FlightTracker/1.0")
+	response, err := aircraftImageHTTPClient.Do(request)
+	if err != nil {
+		http.Error(w, "aircraft image unavailable", http.StatusBadGateway)
+		return
+	}
+	if response.StatusCode != http.StatusOK {
+		response.Body.Close()
+		http.Error(w, "aircraft image unavailable", http.StatusNotFound)
+		return
+	}
+	var result struct {
+		Photos []struct {
+			Thumbnail struct {
+				Source string `json:"src"`
+			} `json:"thumbnail"`
+			ThumbnailLarge struct {
+				Source string `json:"src"`
+			} `json:"thumbnail_large"`
+		} `json:"photos"`
+	}
+	decodeErr := json.NewDecoder(response.Body).Decode(&result)
+	response.Body.Close()
+	if decodeErr != nil || len(result.Photos) == 0 {
+		http.Error(w, "aircraft image unavailable", http.StatusNotFound)
+		return
+	}
+	imageURL := result.Photos[0].ThumbnailLarge.Source
+	if imageURL == "" {
+		imageURL = result.Photos[0].Thumbnail.Source
+	}
+	parsedURL, err := url.Parse(imageURL)
+	if err != nil || parsedURL.Scheme != "https" || (parsedURL.Hostname() != "planespotters.net" && !strings.HasSuffix(parsedURL.Hostname(), ".planespotters.net")) {
+		http.Error(w, "aircraft image unavailable", http.StatusNotFound)
+		return
+	}
+	imageRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, imageURL, nil)
+	if err != nil {
+		http.Error(w, "aircraft image unavailable", http.StatusBadGateway)
+		return
+	}
+	imageRequest.Header.Set("User-Agent", "SDR-FlightTracker/1.0")
+	imageResponse, err := aircraftImageHTTPClient.Do(imageRequest)
+	if err != nil {
+		http.Error(w, "aircraft image unavailable", http.StatusBadGateway)
+		return
+	}
+	defer imageResponse.Body.Close()
+	if imageResponse.StatusCode != http.StatusOK || !strings.HasPrefix(imageResponse.Header.Get("Content-Type"), "image/") {
+		http.Error(w, "aircraft image unavailable", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", imageResponse.Header.Get("Content-Type"))
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	if _, err := io.Copy(w, imageResponse.Body); err != nil {
+		log.Printf("aircraft image copy failed for aircraft=%s: %v", icao, err)
+	}
+}
+
 type webAircraft struct {
-	ICAO          string   `json:"icao"`
-	Raw           string   `json:"raw"`
-	Frames        int      `json:"frames"`
-	Downlink      int      `json:"downlinkFormat"`
-	MessageType   int      `json:"messageType"`
-	PositionReady bool     `json:"positionReady"`
-	Registration  string   `json:"registration,omitempty"`
-	Manufacturer  string   `json:"manufacturer,omitempty"`
-	Model         string   `json:"model,omitempty"`
-	TypeCode      string   `json:"typecode,omitempty"`
-	Operator      string   `json:"operator,omitempty"`
-	Country       string   `json:"country,omitempty"`
-	Callsign      string   `json:"callsign,omitempty"`
-	Altitude      *int     `json:"altitudeFeet,omitempty"`
-	Speed         *float64 `json:"speedKnots,omitempty"`
-	Heading       *float64 `json:"headingDeg,omitempty"`
-	Vertical      *int     `json:"verticalFPM,omitempty"`
-	Latitude      *float64 `json:"latitude,omitempty"`
-	Longitude     *float64 `json:"longitude,omitempty"`
+	ICAO              string   `json:"icao"`
+	Raw               string   `json:"raw"`
+	Frames            int      `json:"frames"`
+	Downlink          int      `json:"downlinkFormat"`
+	MessageType       int      `json:"messageType"`
+	PositionReady     bool     `json:"positionReady"`
+	Registration      string   `json:"registration,omitempty"`
+	Manufacturer      string   `json:"manufacturer,omitempty"`
+	Model             string   `json:"model,omitempty"`
+	TypeCode          string   `json:"typecode,omitempty"`
+	Operator          string   `json:"operator,omitempty"`
+	Country           string   `json:"country,omitempty"`
+	Callsign          string   `json:"callsign,omitempty"`
+	Altitude          *int     `json:"altitudeFeet,omitempty"`
+	Speed             *float64 `json:"speedKnots,omitempty"`
+	Heading           *float64 `json:"headingDeg,omitempty"`
+	Vertical          *int     `json:"verticalFPM,omitempty"`
+	Latitude          *float64 `json:"latitude,omitempty"`
+	Longitude         *float64 `json:"longitude,omitempty"`
+	PositionTime      string   `json:"positionTimestamp,omitempty"`
+	PositionReference string   `json:"positionReference,omitempty"`
 }
 
 func toWebAircraft(m adsb.Message) webAircraft {
@@ -253,6 +443,10 @@ func toWebAircraft(m adsb.Message) webAircraft {
 	w.Callsign = m.Callsign
 	w.Altitude, w.Speed, w.Heading, w.Vertical = m.AltitudeFeet, m.SpeedKnots, m.HeadingDeg, m.VerticalFPM
 	w.Latitude, w.Longitude = m.Latitude, m.Longitude
+	if !m.PositionTime.IsZero() {
+		w.PositionTime = m.PositionTime.UTC().Format(time.RFC3339Nano)
+	}
+	w.PositionReference = m.PositionReference
 	w.Registration = metadataValue(m.Metadata, "registration", "manufacturer", "model", "typecode", "operator", "country")
 	w.Manufacturer = metadataValue(m.Metadata, "manufacturer", "model", "typecode", "operator", "country")
 	w.Model = metadataValue(m.Metadata, "model", "typecode", "operator", "country")
@@ -283,9 +477,9 @@ type cprValue struct {
 	received time.Time
 }
 
-func updateCPR(m *adsb.Message, states map[string][2]*cprValue) {
+func updateCPR(m *adsb.Message, states map[string][2]*cprValue, receivedAt time.Time) {
 	p := states[m.ICAO]
-	v := &cprValue{lat: m.CPRLat, lon: m.CPRLon, odd: m.CPROdd, received: time.Now()}
+	v := &cprValue{lat: m.CPRLat, lon: m.CPRLon, odd: m.CPROdd, received: receivedAt}
 	if m.CPROdd {
 		p[1] = v
 	} else {
@@ -335,6 +529,156 @@ func updateCPR(m *adsb.Message, states map[string][2]*cprValue) {
 		lon -= 360
 	}
 	m.Latitude, m.Longitude = &lat, &lon
+	m.PositionTime = v.received
+	if latestOdd {
+		m.PositionReference = "odd"
+	} else {
+		m.PositionReference = "even"
+	}
+}
+
+type positionEvaluation struct {
+	decision          string
+	reason            string
+	accepted          bool
+	trackReset        bool
+	elapsedSeconds    float64
+	distanceMeters    float64
+	impliedSpeedKnots float64
+	allowedSpeedKnots float64
+}
+
+func evaluatePosition(previous, current adsb.Message) positionEvaluation {
+	result := positionEvaluation{decision: "accepted", accepted: true, reason: "first_position", allowedSpeedKnots: allowedPositionSpeed(previous)}
+	if previous.Latitude == nil || previous.Longitude == nil || previous.PositionTime.IsZero() || current.Latitude == nil || current.Longitude == nil {
+		return result
+	}
+	elapsed := current.PositionTime.Sub(previous.PositionTime)
+	result.elapsedSeconds = elapsed.Seconds()
+	if elapsed >= trackGap {
+		result.reason = "track_gap"
+		result.trackReset = true
+		return result
+	}
+	if elapsed <= 0 {
+		result.decision = "rejected"
+		result.reason = "non_increasing_timestamp"
+		result.accepted = false
+		return result
+	}
+	result.distanceMeters = distanceMeters(*previous.Latitude, *previous.Longitude, *current.Latitude, *current.Longitude)
+	result.impliedSpeedKnots = result.distanceMeters / elapsed.Seconds() * 1.9438444924406
+	if result.distanceMeters > maximumPositionJumpMeters {
+		result.decision = "rejected"
+		result.reason = "jump_exceeds_distance_limit"
+		result.accepted = false
+		return result
+	}
+	if result.distanceMeters <= positionErrorAllowanceMeters {
+		result.reason = "within_position_tolerance"
+		return result
+	}
+	if result.impliedSpeedKnots > result.allowedSpeedKnots {
+		result.decision = "rejected"
+		result.reason = "implied_speed_exceeds_limit"
+		result.accepted = false
+		return result
+	}
+	result.reason = "plausible_movement"
+	return result
+}
+
+func allowedPositionSpeed(previous adsb.Message) float64 {
+	allowed := minimumAllowedGroundSpeedKnots
+	if previous.SpeedKnots != nil {
+		allowed = math.Max(allowed, *previous.SpeedKnots*1.75+100)
+	}
+	return math.Min(allowed, maximumGroundSpeedKnots)
+}
+
+func validPosition(previous, current adsb.Message) bool {
+	return evaluatePosition(previous, current).accepted
+}
+
+func makeTrackingEntry(receivedAt time.Time, decoded, previous adsb.Message, previousExists bool, stored adsb.Message, evaluation positionEvaluation, pair [2]*cprValue) tracking.Entry {
+	entry := tracking.Entry{
+		Event:              "adsb_frame",
+		ReceivedAt:         receivedAt,
+		ICAO:               decoded.ICAO,
+		Registration:       metadataValue(stored.Metadata, "registration", "manufacturer", "model", "typecode", "operator", "country"),
+		Callsign:           stored.Callsign,
+		RawFrame:           decoded.Raw,
+		DownlinkFormat:     decoded.DownlinkFormat,
+		TypeCode:           decoded.TypeCode,
+		AltitudeFeet:       stored.AltitudeFeet,
+		ReportedSpeedKnots: stored.SpeedKnots,
+		HeadingDegrees:     stored.HeadingDeg,
+		PositionDecision:   evaluation.decision,
+		DecisionReason:     evaluation.reason,
+		TrackReset:         evaluation.trackReset,
+		CPRReference:       decoded.PositionReference,
+	}
+	if decoded.HasCPR {
+		entry.CPR = &tracking.CPR{Latitude: decoded.CPRLat, Longitude: decoded.CPRLon, Odd: decoded.CPROdd}
+	}
+	if pair[0] != nil {
+		entry.EvenCPR = &tracking.CPRSample{Latitude: pair[0].lat, Longitude: pair[0].lon, ReceivedAt: pair[0].received}
+	}
+	if pair[1] != nil {
+		entry.OddCPR = &tracking.CPRSample{Latitude: pair[1].lat, Longitude: pair[1].lon, ReceivedAt: pair[1].received}
+	}
+	entry.DecodedPosition = trackingPosition(decoded)
+	if previousExists {
+		entry.PreviousPosition = trackingPosition(previous)
+	}
+	entry.StoredPosition = trackingPosition(stored)
+	if decoded.Latitude != nil && previousExists && previous.Latitude != nil {
+		entry.ElapsedSeconds = floatPointer(evaluation.elapsedSeconds)
+		entry.DistanceMeters = floatPointer(evaluation.distanceMeters)
+		entry.ImpliedSpeedKnots = floatPointer(evaluation.impliedSpeedKnots)
+		entry.AllowedSpeedKnots = floatPointer(evaluation.allowedSpeedKnots)
+	}
+	return entry
+}
+
+func trackingPosition(message adsb.Message) *tracking.Position {
+	if message.Latitude == nil || message.Longitude == nil || message.PositionTime.IsZero() {
+		return nil
+	}
+	return &tracking.Position{Latitude: *message.Latitude, Longitude: *message.Longitude, Timestamp: message.PositionTime}
+}
+
+func floatPointer(value float64) *float64 { return &value }
+
+func distanceMeters(lat1, lon1, lat2, lon2 float64) float64 {
+	const earthRadius = 6_371_000.0
+	phi1, phi2 := lat1*math.Pi/180, lat2*math.Pi/180
+	dPhi, dLambda := (lat2-lat1)*math.Pi/180, (lon2-lon1)*math.Pi/180
+	a := math.Sin(dPhi/2)*math.Sin(dPhi/2) + math.Cos(phi1)*math.Cos(phi2)*math.Sin(dLambda/2)*math.Sin(dLambda/2)
+	return earthRadius * 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+}
+
+func expireFlights(flights map[string]adsb.Message, now time.Time) {
+	for icao, flight := range flights {
+		if flight.LastSeen.IsZero() || now.Sub(flight.LastSeen) > aircraftExpiry {
+			delete(flights, icao)
+		}
+	}
+}
+
+func expireCPR(states map[string][2]*cprValue, now time.Time) {
+	for icao, pair := range states {
+		for i, value := range pair {
+			if value != nil && now.Sub(value.received) > cprExpiry {
+				pair[i] = nil
+			}
+		}
+		if pair[0] == nil && pair[1] == nil {
+			delete(states, icao)
+		} else {
+			states[icao] = pair
+		}
+	}
 }
 
 func positiveMod(value, divisor float64) float64 {
@@ -342,7 +686,7 @@ func positiveMod(value, divisor float64) float64 {
 }
 func cprNL(x float64) int {
 	a := math.Abs(x)
-	table := []float64{10.47047130, 14.82817437, 18.18626357, 21.02939493, 23.54504487, 25.82924707, 27.93898710, 29.91135686, 31.77209708, 33.53993436, 35.22899598, 36.85025108, 38.41241892, 39.92256684, 41.38651832, 42.80914012, 44.19454951, 45.54626723, 46.86733252, 48.16039128, 49.42657329, 50.67430654, 51.88118079, 53.09030787, 54.28372143, 55.51114624, 56.74896827, 57.99123265, 59.29165945, 60.42375649, 61.55915745, 62.74216572, 63.86768462, 64.99578747, 66.08326154, 67.17905545, 68.15212705, 69.17814108, 70.17075792, 71.06688139, 71.99176150, 72.93072889, 73.86700662, 74.74713461, 75.70491253, 76.48024657, 77.30657830, 78.07284587, 78.83312199, 79.44456549, 80.16988713, 80.82657905, 81.32875431, 81.99087188, 82.73999104, 83.99196815, 85}
+	table := []float64{10.47047130, 14.82817437, 18.18626357, 21.02939493, 23.54504487, 25.82924707, 27.93898710, 29.91135686, 31.77209708, 33.53993436, 35.22899598, 36.85025108, 38.41241892, 39.92256684, 41.38651832, 42.80914012, 44.19454951, 45.54626723, 46.86733252, 48.16039128, 49.42657329, 50.67430654, 51.88118079, 53.09030787, 54.28372143, 55.51114624, 56.74896827, 57.99123265, 59.29165945, 60.42375649, 61.55915745, 62.74216572, 63.86768462, 64.99578747, 66.08326154, 67.17905545, 68.15212705, 69.17814108, 70.17075792, 71.06688139, 71.99176150, 72.93072889, 73.86700662, 74.74713461, 75.70491253, 76.48024657, 77.30657830, 78.07284587, 78.83312199, 79.44456549, 80.16988713, 80.82657905, 81.32875431, 81.99087188, 82.73999104, 83.99196815, 85, 87}
 	for i, v := range table {
 		if a < v {
 			return 59 - i
@@ -390,6 +734,8 @@ func merge(old, current adsb.Message) adsb.Message {
 	}
 	if current.Latitude == nil {
 		current.Latitude, current.Longitude = old.Latitude, old.Longitude
+		current.PositionTime = old.PositionTime
+		current.PositionReference = old.PositionReference
 	}
 	if current.AltitudeFeet == nil {
 		current.AltitudeFeet = old.AltitudeFeet

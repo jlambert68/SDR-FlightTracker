@@ -6,27 +6,31 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 )
 
 // Message contains the fields that can be decoded from one ADS-B frame.
 type Message struct {
-	Raw            string
-	DownlinkFormat int
-	ICAO           string
-	TypeCode       int
-	Frames         int
-	Metadata       string
-	CPRLat         int
-	CPRLon         int
-	CPROdd         bool
-	HasCPR         bool
-	Callsign       string
-	AltitudeFeet   *int
-	SpeedKnots     *float64
-	HeadingDeg     *float64
-	VerticalFPM    *int
-	Latitude       *float64
-	Longitude      *float64
+	Raw               string
+	DownlinkFormat    int
+	ICAO              string
+	TypeCode          int
+	Frames            int
+	Metadata          string
+	CPRLat            int
+	CPRLon            int
+	CPROdd            bool
+	HasCPR            bool
+	Callsign          string
+	AltitudeFeet      *int
+	SpeedKnots        *float64
+	HeadingDeg        *float64
+	VerticalFPM       *int
+	Latitude          *float64
+	Longitude         *float64
+	PositionTime      time.Time
+	PositionReference string
+	LastSeen          time.Time
 }
 
 func (m Message) String() string {

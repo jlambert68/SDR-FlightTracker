@@ -69,6 +69,7 @@ Useful options:
 -metadata-url   metadata endpoint base URL
 -lat            receiver latitude (otherwise estimated from public IP)
 -lon            receiver longitude (otherwise estimated from public IP)
+-tracking-dir   per-aircraft tracking log directory (default: tracking-data)
 ```
 
 For example:
@@ -100,6 +101,28 @@ the `*8D...;` format produced by `rtl_adsb` and run:
 ```sh
 ./bin/flighttracker -input messages.txt
 ```
+
+## Tracking diagnostics
+
+Every valid ADS-B frame is recorded as newline-delimited JSON for later path
+analysis. The default layout uses the aircraft's stable ICAO address as its
+folder name and starts a new file each UTC day:
+
+```text
+tracking-data/
+  4CAFD6/
+    2026-10-08.jsonl
+```
+
+Each line is a complete JSON object containing the raw frame, even/odd CPR
+values and timestamps, decoded and previously accepted positions, distance and
+elapsed time, implied and allowed speeds, the stored position, and the exact
+accept/reject reason. Records with `event: "map_position_set"` are browser
+acknowledgements created only when a new point is inserted into the Cesium 3D
+world. They contain the browser timestamp and session ID, latitude, longitude,
+altitude, Earth-centered Cartesian coordinates, and whether the even or odd CPR
+frame was the position reference. Set `-tracking-dir` to another directory or
+to an empty string to disable recording.
 
 The application plays `/usr/share/sounds/freedesktop/stereo/bell.oga` through
 PipeWire (`pw-play`) for startup and detection sounds when available. If
