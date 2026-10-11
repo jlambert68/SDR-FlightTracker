@@ -44,10 +44,24 @@ serves the map and pushes the current aircraft list over Server-Sent Events.
 Use the `Tottkällevägen 4A` button in the upper-right corner to return the
 camera to the configured receiver position. This address is the default home
 position; override it for another receiver site with `-lat` and `-lon`.
+Stockholm Arlanda and Stockholm Bromma are marked at their airport reference
+points with a ground marker and a vertical line to a labeled 5,000 ft marker.
+The purple Home sight volume is configured in `web/sight-config.json`. Its four
+beams are listed in perimeter order (lower left, lower right, upper right,
+upper left). `horizontalDegrees` is a compass bearing clockwise from true north,
+and `verticalDegrees` is an angle above the local horizon; negative vertical
+angles point below it. `rangeMeters` controls the length of all four beams. The
+map's Home sight volume panel updates these values immediately and saves the
+browser's settings locally. **Reset sight volume** restores the JSON defaults.
+The supplied 240°–300° horizontal and 0°–45° vertical limits are an editable
+west-facing starting point; set them to the measured limits of the real view.
+While at least one current aircraft position is inside those horizontal,
+vertical, and range limits, the map requests a bell every five seconds and the
+panel shows the number of aircraft inside. The bell stops as soon as no current
+position is inside or the live map connection closes.
 Aircraft with decoded CPR coordinates are shown at their received position;
-aircraft waiting for a matching CPR pair are stacked above the receiver so
-they remain visible. Click an aircraft marker for its readable metadata and
-telemetry.
+aircraft without a position remain visible in the aircraft list. Click an
+aircraft marker for its readable metadata and telemetry.
 
 Example output:
 
@@ -64,9 +78,11 @@ Useful options:
 -gain auto      automatic gain, or a value in dB such as 38.6
 -ppm 0          tuner frequency correction
 -bias-tee       enable bias power for an active antenna (use with care)
--mute           disable the short terminal beep for each valid message
+-mute           disable startup and Home sight-volume bells
 -metadata       look up registration, model, operator, and country (default on)
 -metadata-url   metadata endpoint base URL
+-routes         look up departure and destination airports (default on)
+-route-url      flight route endpoint base URL
 -lat            receiver latitude (otherwise estimated from public IP)
 -lon            receiver longitude (otherwise estimated from public IP)
 -tracking-dir   per-aircraft tracking log directory (default: tracking-data)
@@ -82,13 +98,21 @@ For each new ICAO address the program makes one best-effort request to the
 HexDB aircraft metadata endpoint. When available, log lines include fields
 such as `registration`, `manufacturer`, `model`, `operator`, and `country`.
 Lookups are cached for the lifetime of the process, have a three-second timeout,
-and never prevent radio data from being decoded. Disable network lookups with
-`-metadata=false`.
+and never prevent radio data from being decoded. Disable aircraft metadata
+lookups with `-metadata=false`.
+
+When an aircraft transmits a callsign, the program makes one cached route lookup
+through the public ADSBDB endpoint. The information panel and tracking JSON then
+show the departure and destination airport names with their IATA and ICAO codes.
+Route information cannot be determined when no callsign has been received.
+Disable these lookups with `-routes=false`.
 
 The receiver position is estimated from `https://ipapi.co/json/` when `-lat`
 and `-lon` are omitted. For accuracy or privacy, provide both coordinates
-manually. Aircraft latitude and longitude are calculated locally after an even
-and an odd CPR position frame have been received.
+manually. A recent even/odd CPR pair provides a globally decoded position. A
+single position frame is decoded locally from the receiver position or the
+aircraft's last accepted position, so dropped pairs do not leave large holes in
+the track.
 
 Failures are reported with timestamps in the log. Messages such as `metadata
 lookup failed` include the aircraft address, endpoint, and HTTP or network error.
@@ -117,19 +141,21 @@ tracking-data/
 Each line is a complete JSON object containing the raw frame, even/odd CPR
 values and timestamps, decoded and previously accepted positions, distance and
 elapsed time, implied and allowed speeds, the stored position, and the exact
-accept/reject reason. Records with `event: "map_position_set"` are browser
+accept/reject reason. When available, records also contain the departure and
+destination airports resolved from the callsign. Records with
+`event: "map_position_set"` are browser
 acknowledgements created only when a new point is inserted into the Cesium 3D
 world. They contain the browser timestamp and session ID, latitude, longitude,
-altitude, Earth-centered Cartesian coordinates, and whether the even or odd CPR
-frame was the position reference. Set `-tracking-dir` to another directory or
-to an empty string to disable recording.
+altitude, Earth-centered Cartesian coordinates, and the CPR decoding reference
+(global pair, receiver, or previous aircraft position). Set `-tracking-dir` to
+another directory or to an empty string to disable recording.
 
-The application plays `/usr/share/sounds/freedesktop/stereo/bell.oga` through
-PipeWire (`pw-play`) for startup and detection sounds when available. If
-`pw-play` is unavailable, it falls back to the terminal bell. ADS-B messages
+The application plays `/usr/share/sounds/freedesktop/stereo/bell.oga` for the
+startup and Home sight-volume bells. It tries `pw-play`, `paplay`,
+`canberra-gtk-play`, `gst-play-1.0`, and `ffplay` in order, and falls back to the
+terminal bell if the installed player cannot reach the audio system. ADS-B messages
 distribute aircraft data across several transmissions. The
 application keeps one record per aircraft and carries previously received fields
 forward, so later log lines show the accumulated callsign, altitude, speed,
 heading, and vertical rate. `frames` is the number of valid messages received
-for that aircraft and `raw` is the latest complete 112-bit frame. Position
-requires pairing even and odd CPR frames and is outside this initial version.
+for that aircraft and `raw` is the latest complete 112-bit frame.

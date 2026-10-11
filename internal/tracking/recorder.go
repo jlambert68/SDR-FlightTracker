@@ -56,6 +56,8 @@ type Entry struct {
 	ICAO               string         `json:"icao"`
 	Registration       string         `json:"registration,omitempty"`
 	Callsign           string         `json:"callsign,omitempty"`
+	DepartureAirport   string         `json:"departureAirport,omitempty"`
+	DestinationAirport string         `json:"destinationAirport,omitempty"`
 	RawFrame           string         `json:"rawFrame"`
 	DownlinkFormat     int            `json:"downlinkFormat"`
 	TypeCode           int            `json:"typeCode"`

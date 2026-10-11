@@ -1,0 +1,31 @@
+{
+  "name": "Tottkällevägen 4A sight volume",
+  "origin": {
+    "latitude": 59.323316,
+    "longitude": 18.480349,
+    "heightMeters": 18
+  },
+  "rangeMeters": 30000,
+  "beams": [
+    {
+      "name": "Lower left",
+      "horizontalDegrees": 240,
+      "verticalDegrees": 0
+    },
+    {
+      "name": "Lower right",
+      "horizontalDegrees": 300,
+      "verticalDegrees": 0
+    },
+    {
+      "name": "Upper right",
+      "horizontalDegrees": 300,
+      "verticalDegrees": 45
+    },
+    {
+      "name": "Upper left",
+      "horizontalDegrees": 240,
+      "verticalDegrees": 45
+    }
+  ]
+}

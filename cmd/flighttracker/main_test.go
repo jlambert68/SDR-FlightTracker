@@ -23,12 +23,13 @@ func TestUpdateCPRKnownPosition(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	updateCPR(&even, states, now)
+	reference := cprDecodeReference{latitude: 52.0, longitude: -4.0, source: "receiver"}
+	updateCPR(&even, states, now, reference)
 	odd, err := adsb.DecodeLine("8D40621D58C386435CC412692AD6")
 	if err != nil {
 		t.Fatal(err)
 	}
-	updateCPR(&odd, states, now.Add(time.Second))
+	updateCPR(&odd, states, now.Add(time.Second), reference)
 	if odd.Latitude == nil || odd.Longitude == nil {
 		t.Fatal("position was not decoded")
 	}
@@ -40,8 +41,80 @@ func TestUpdateCPRKnownPosition(t *testing.T) {
 	}
 }
 
+func TestUpdateCPRStockholmLongitudeZone(t *testing.T) {
+	states := make(map[string][2]*cprValue)
+	even, err := adsb.DecodeLine("8D4AB565584303776900428E6A06")
+	if err != nil {
+		t.Fatal(err)
+	}
+	odd, err := adsb.DecodeLine("8D4AB5655841E6CF7AE6AF7D8FB9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	reference := cprDecodeReference{latitude: homeLatitude, longitude: homeLongitude, source: "receiver"}
+	updateCPR(&even, states, now, reference)
+	updateCPR(&odd, states, now.Add(2*time.Second), reference)
+	if odd.Latitude == nil || odd.Longitude == nil {
+		t.Fatal("position was not decoded")
+	}
+	if math.Abs(*odd.Latitude-59.20238947464247) > 1e-9 || math.Abs(*odd.Longitude-18.006875926050647) > 1e-9 {
+		t.Fatalf("unexpected Stockholm position: %.9f, %.9f", *odd.Latitude, *odd.Longitude)
+	}
+}
+
+func TestUpdateCPRDecodesSingleFramesLocally(t *testing.T) {
+	states := make(map[string][2]*cprValue)
+	even, err := adsb.DecodeLine("8D4D241058371394FB072EDB94B1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	receiver := cprDecodeReference{latitude: homeLatitude, longitude: homeLongitude, source: "receiver"}
+	updateCPR(&even, states, now, receiver)
+	if even.Latitude == nil || even.Longitude == nil {
+		t.Fatal("single even frame was not locally decoded")
+	}
+	if math.Abs(*even.Latitude-59.37290954589844) > 1e-9 || math.Abs(*even.Longitude-18.16827392578125) > 1e-9 {
+		t.Fatalf("unexpected local even position: %.9f, %.9f", *even.Latitude, *even.Longitude)
+	}
+	if even.PositionReference != "local_receiver_even" {
+		t.Fatalf("position reference = %q, want local_receiver_even", even.PositionReference)
+	}
+
+	odd, err := adsb.DecodeLine("8D4D2410581F771DDAEE38817423")
+	if err != nil {
+		t.Fatal(err)
+	}
+	aircraft := cprDecodeReference{latitude: *even.Latitude, longitude: *even.Longitude, source: "aircraft"}
+	updateCPR(&odd, states, now.Add(212*time.Second), aircraft)
+	if odd.Latitude == nil || odd.Longitude == nil {
+		t.Fatal("single odd frame was not locally decoded")
+	}
+	if math.Abs(*odd.Latitude-59.66940152443061) > 1e-9 || math.Abs(*odd.Longitude-18.18957098599138) > 1e-9 {
+		t.Fatalf("unexpected local odd position: %.9f, %.9f", *odd.Latitude, *odd.Longitude)
+	}
+	if odd.PositionReference != "local_aircraft_odd" {
+		t.Fatalf("position reference = %q, want local_aircraft_odd", odd.PositionReference)
+	}
+	reportedSpeed := 332.86633954186476
+	even.SpeedKnots = &reportedSpeed
+	evaluation := evaluatePosition(even, odd)
+	if !evaluation.accepted || !evaluation.trackReset || evaluation.reason != "track_gap" {
+		t.Fatalf("locally decoded frames did not form valid track segments: %+v", evaluation)
+	}
+}
+
 func TestCPRNLNearPoles(t *testing.T) {
-	for latitude, want := range map[float64]int{84.5: 3, 86: 2, 88: 1} {
+	for latitude, want := range map[float64]int{84.5: 5, 86: 3, 87: 2, 88: 1} {
+		if got := cprNL(latitude); got != want {
+			t.Errorf("cprNL(%v) = %d, want %d", latitude, got, want)
+		}
+	}
+}
+
+func TestCPRNLStockholmLatitude(t *testing.T) {
+	for latitude, want := range map[float64]int{58.84: 31, 58.85: 30, 59.2: 30, 59.96: 29} {
 		if got := cprNL(latitude); got != want {
 			t.Errorf("cprNL(%v) = %d, want %d", latitude, got, want)
 		}
@@ -69,9 +142,36 @@ func TestValidPositionRejectsImpossibleJump(t *testing.T) {
 func TestValidPositionStartsAgainAfterTrackGap(t *testing.T) {
 	now := time.Now()
 	previous := messageAt(59.32, 18.48, now)
+	reportedSpeed := 300.0
+	previous.SpeedKnots = &reportedSpeed
+	current := messageAt(59.57, 18.48, now.Add(trackGap))
+	evaluation := evaluatePosition(previous, current)
+	if !evaluation.accepted || !evaluation.trackReset || evaluation.reason != "track_gap" {
+		t.Fatalf("unexpected track-gap evaluation: %+v", evaluation)
+	}
+}
+
+func TestValidPositionRejectsImpossibleJumpAfterTrackGap(t *testing.T) {
+	now := time.Now()
+	previous := messageAt(59.32, 18.48, now)
+	reportedSpeed := 230.0
+	previous.SpeedKnots = &reportedSpeed
 	current := messageAt(61.00, 22.00, now.Add(trackGap))
-	if !validPosition(previous, current) {
-		t.Fatal("first position after a track gap was rejected")
+	evaluation := evaluatePosition(previous, current)
+	if evaluation.accepted || evaluation.reason != "jump_exceeds_distance_limit" {
+		t.Fatalf("unexpected track-gap jump evaluation: %+v", evaluation)
+	}
+}
+
+func TestValidPositionRejectsCapturedSASDiscontinuity(t *testing.T) {
+	positionTime := time.Date(2026, 10, 11, 14, 41, 13, 142798707, time.UTC)
+	previous := messageAt(59.2884521484375, 17.588048135080644, positionTime)
+	reportedSpeed := 231.24878378058557
+	previous.SpeedKnots = &reportedSpeed
+	current := messageAt(59.37570345603813, 18.093061775996766, positionTime.Add(101*time.Second+577844816*time.Nanosecond))
+	evaluation := evaluatePosition(previous, current)
+	if evaluation.accepted || evaluation.reason != "implied_speed_exceeds_limit" {
+		t.Fatalf("captured false jump was not rejected: %+v", evaluation)
 	}
 }
 
@@ -120,16 +220,63 @@ func TestExpireCPR(t *testing.T) {
 	}
 }
 
+func TestSightBellEndpointValidatesAndRateLimitsRequests(t *testing.T) {
+	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+	rings := 0
+	endpoint := &sightBellEndpoint{
+		interval: 4 * time.Second,
+		now:      func() time.Time { return now },
+		ring:     func() { rings++ },
+	}
+	post := func(body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/sight-bell", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		endpoint.ServeHTTP(response, request)
+		return response
+	}
+
+	if response := post(`{"aircraft":["4D2410"]}`); response.Code != http.StatusNoContent || rings != 1 {
+		t.Fatalf("first alert: status=%d rings=%d", response.Code, rings)
+	}
+	now = now.Add(3 * time.Second)
+	if response := post(`{"aircraft":["4D2410"]}`); response.Code != http.StatusNoContent || rings != 1 {
+		t.Fatalf("rate-limited alert: status=%d rings=%d", response.Code, rings)
+	}
+	now = now.Add(time.Second)
+	if response := post(`{"aircraft":["4D2410","ABC123"]}`); response.Code != http.StatusNoContent || rings != 2 {
+		t.Fatalf("second alert: status=%d rings=%d", response.Code, rings)
+	}
+	if response := post(`{"aircraft":["invalid"]}`); response.Code != http.StatusBadRequest || rings != 2 {
+		t.Fatalf("invalid alert: status=%d rings=%d", response.Code, rings)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/sight-bell", nil)
+	response := httptest.NewRecorder()
+	endpoint.ServeHTTP(response, request)
+	if response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != http.MethodPost {
+		t.Fatalf("GET alert: status=%d allow=%q", response.Code, response.Header().Get("Allow"))
+	}
+}
+
 func TestServeAircraftImage(t *testing.T) {
 	originalClient := aircraftImageHTTPClient
 	originalURL := aircraftPhotoAPIBaseURL
+	originalRegistrationURL := aircraftPhotoRegistrationAPIBaseURL
 	aircraftPhotoAPIBaseURL = "https://api.planespotters.net/pub/photos/hex/"
+	aircraftPhotoRegistrationAPIBaseURL = "https://api.planespotters.net/pub/photos/reg/"
 	aircraftImageHTTPClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		switch request.URL.String() {
 		case "https://api.planespotters.net/pub/photos/hex/abc123":
-			body := `{"photos":[{"thumbnail":{"src":"https://cdn.planespotters.net/photo.jpg"}}]}`
+			if request.Header.Get("User-Agent") != aircraftPhotoUserAgent || request.Header.Get("Accept") != "application/json" {
+				t.Fatalf("unexpected photo API headers: %v", request.Header)
+			}
+			body := `{"photos":[{"thumbnail_large":{"src":"https://t.plnspttrs.net/photo.jpg"}}]}`
 			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
-		case "https://cdn.planespotters.net/photo.jpg":
+		case "https://t.plnspttrs.net/photo.jpg":
+			if request.Header.Get("Referer") != "https://www.planespotters.net/" {
+				t.Fatalf("unexpected image referer: %q", request.Header.Get("Referer"))
+			}
 			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"image/jpeg"}}, Body: io.NopCloser(strings.NewReader("photo"))}, nil
 		default:
 			t.Fatalf("unexpected upstream request: %s", request.URL.String())
@@ -138,6 +285,7 @@ func TestServeAircraftImage(t *testing.T) {
 	})}
 	defer func() {
 		aircraftPhotoAPIBaseURL = originalURL
+		aircraftPhotoRegistrationAPIBaseURL = originalRegistrationURL
 		aircraftImageHTTPClient = originalClient
 	}()
 
@@ -149,6 +297,40 @@ func TestServeAircraftImage(t *testing.T) {
 	}
 	if got := response.Header().Get("Cache-Control"); got != "public, max-age=86400" {
 		t.Fatalf("unexpected cache header: %q", got)
+	}
+}
+
+func TestServeAircraftImageFallsBackToRegistration(t *testing.T) {
+	originalClient := aircraftImageHTTPClient
+	originalURL := aircraftPhotoAPIBaseURL
+	originalRegistrationURL := aircraftPhotoRegistrationAPIBaseURL
+	aircraftPhotoAPIBaseURL = "https://photo.test/hex/"
+	aircraftPhotoRegistrationAPIBaseURL = "https://photo.test/reg/"
+	aircraftImageHTTPClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.String() {
+		case "https://photo.test/hex/4d2410":
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"photos":[]}`))}, nil
+		case "https://photo.test/reg/9H-EXS":
+			body := `{"photos":[{"thumbnail":{"src":"https://t.plnspttrs.net/9h-exs.jpg"}}]}`
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+		case "https://t.plnspttrs.net/9h-exs.jpg":
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"image/jpeg"}}, Body: io.NopCloser(strings.NewReader("registration photo"))}, nil
+		default:
+			t.Fatalf("unexpected upstream request: %s", request.URL.String())
+			return nil, nil
+		}
+	})}
+	defer func() {
+		aircraftPhotoAPIBaseURL = originalURL
+		aircraftPhotoRegistrationAPIBaseURL = originalRegistrationURL
+		aircraftImageHTTPClient = originalClient
+	}()
+
+	request := httptest.NewRequest(http.MethodGet, "/aircraft-image?hex=4D2410&reg=9H-EXS", nil)
+	response := httptest.NewRecorder()
+	serveAircraftImage(response, request)
+	if response.Code != http.StatusOK || response.Body.String() != "registration photo" {
+		t.Fatalf("unexpected image response: status=%d body=%q", response.Code, response.Body.String())
 	}
 }
 
@@ -173,7 +355,7 @@ func TestRecordMapPosition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := `{"icao":"471EFB","setAt":"2026-10-08T19:02:00Z","latitude":59.077,"longitude":18.179,"altitudeFeet":20325,"cartesianEcefMeters":{"x":100,"y":200,"z":300},"cprReference":"even","browserSessionId":"browser-1"}`
+	body := `{"icao":"471EFB","setAt":"2026-10-08T19:02:00Z","latitude":59.077,"longitude":18.179,"altitudeFeet":20325,"cartesianEcefMeters":{"x":100,"y":200,"z":300},"cprReference":"local_aircraft_odd","browserSessionId":"browser-1"}`
 	request := httptest.NewRequest(http.MethodPost, "/tracking/map-position", strings.NewReader(body))
 	response := httptest.NewRecorder()
 	recordMapPosition(response, request, recorder)
@@ -195,8 +377,25 @@ func TestRecordMapPosition(t *testing.T) {
 	if err := json.Unmarshal(data, &entry); err != nil {
 		t.Fatal(err)
 	}
-	if entry.Event != "map_position_set" || entry.CPRReference != "even" || entry.WorldPosition == nil || entry.WorldPosition.Cartesian.Z != 300 {
+	if entry.Event != "map_position_set" || entry.CPRReference != "local_aircraft_odd" || entry.WorldPosition == nil || entry.WorldPosition.Cartesian.Z != 300 {
 		t.Fatalf("unexpected map tracking entry: %+v", entry)
+	}
+}
+
+func TestMergeCarriesRouteOnlyForSameFlight(t *testing.T) {
+	previous := adsb.Message{
+		Callsign:           "KLM1023",
+		DepartureAirport:   "Amsterdam Airport Schiphol (AMS/EHAM)",
+		DestinationAirport: "London Heathrow Airport (LHR/EGLL)",
+		Frames:             4,
+	}
+	continued := merge(previous, adsb.Message{})
+	if continued.Callsign != previous.Callsign || continued.DepartureAirport != previous.DepartureAirport || continued.DestinationAirport != previous.DestinationAirport {
+		t.Fatalf("route was not retained for the same flight: %+v", continued)
+	}
+	changed := merge(previous, adsb.Message{Callsign: "SAS123"})
+	if changed.DepartureAirport != "" || changed.DestinationAirport != "" {
+		t.Fatalf("old route was retained after callsign changed: %+v", changed)
 	}
 }
 
