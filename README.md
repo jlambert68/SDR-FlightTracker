@@ -62,6 +62,11 @@ position is inside or the live map connection closes.
 Aircraft with decoded CPR coordinates are shown at their received position;
 aircraft without a position remain visible in the aircraft list. Click an
 aircraft marker for its readable metadata and telemetry.
+When a positioned aircraft first appears, the map retrieves the preceding five
+minutes of its ADSB.lol trace and draws it in brown. The brown history ends at
+the exact first position decoded by this receiver, where the red live track
+begins. Set `-history-duration` to another Go duration such as `10m`, or to `0`
+to disable online history.
 
 Example output:
 
@@ -83,6 +88,8 @@ Useful options:
 -metadata-url   metadata endpoint base URL
 -routes         look up departure and destination airports (default on)
 -route-url      flight route endpoint base URL
+-history-duration  online history before first local position (default: 5m; 0 disables)
+-history-url       ADSB.lol-compatible history service URL
 -lat            receiver latitude (otherwise estimated from public IP)
 -lon            receiver longitude (otherwise estimated from public IP)
 -tracking-dir   per-aircraft tracking log directory (default: tracking-data)
@@ -106,6 +113,12 @@ through the public ADSBDB endpoint. The information panel and tracking JSON then
 show the departure and destination airport names with their IATA and ICAO codes.
 Route information cannot be determined when no callsign has been received.
 Disable these lookups with `-routes=false`.
+
+Flight history is loaded once per newly found, positioned aircraft through the
+Go server, which avoids browser cross-origin restrictions and briefly caches
+the upstream trace for multiple map clients. Current aircraft use ADSB.lol's
+recent trace feed; replayed older data uses the corresponding daily archive
+when it is available. History failures do not interrupt local ADS-B tracking.
 
 The receiver position is estimated from `https://ipapi.co/json/` when `-lat`
 and `-lon` are omitted. For accuracy or privacy, provide both coordinates

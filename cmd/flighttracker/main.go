@@ -24,6 +24,7 @@ import (
 
 	"sdr-flight-tracker/internal/adsb"
 	"sdr-flight-tracker/internal/aircraft"
+	"sdr-flight-tracker/internal/flighthistory"
 	"sdr-flight-tracker/internal/flightroute"
 	"sdr-flight-tracker/internal/location"
 	"sdr-flight-tracker/internal/tracking"
@@ -62,19 +63,21 @@ var receiverPosition = struct {
 }{}
 
 type options struct {
-	device      string
-	gain        string
-	ppm         int
-	biasTee     bool
-	mute        bool
-	metadata    bool
-	metadataURL string
-	routes      bool
-	routeURL    string
-	input       string
-	latitude    float64
-	longitude   float64
-	trackingDir string
+	device          string
+	gain            string
+	ppm             int
+	biasTee         bool
+	mute            bool
+	metadata        bool
+	metadataURL     string
+	routes          bool
+	routeURL        string
+	historyDuration time.Duration
+	historyURL      string
+	input           string
+	latitude        float64
+	longitude       float64
+	trackingDir     string
 }
 
 type bellCommand struct {
@@ -95,11 +98,19 @@ func main() {
 	flag.StringVar(&opts.metadataURL, "metadata-url", "https://hexdb.io/api/v1/aircraft", "aircraft metadata service URL")
 	flag.BoolVar(&opts.routes, "routes", true, "look up departure and destination airports online")
 	flag.StringVar(&opts.routeURL, "route-url", "https://api.adsbdb.com/v0/callsign", "flight route service URL")
+	flag.DurationVar(&opts.historyDuration, "history-duration", 5*time.Minute, "online flight history to draw before first local position; 0 disables")
+	flag.StringVar(&opts.historyURL, "history-url", "https://adsb.lol", "ADSB.lol-compatible flight history service URL")
 	flag.StringVar(&opts.input, "input", "", "read rtl_adsb text from a file, or - for stdin")
 	flag.Float64Var(&opts.latitude, "lat", homeLatitude, "receiver latitude")
 	flag.Float64Var(&opts.longitude, "lon", homeLongitude, "receiver longitude")
 	flag.StringVar(&opts.trackingDir, "tracking-dir", "tracking-data", "directory for per-aircraft JSON tracking logs; empty disables logging")
 	flag.Parse()
+	if opts.historyDuration < 0 {
+		log.Fatal("-history-duration cannot be negative")
+	}
+	if opts.historyDuration > 0 && strings.TrimSpace(opts.historyURL) == "" {
+		log.Fatal("-history-url is required when flight history is enabled")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -134,7 +145,10 @@ func main() {
 			log.Printf("close tracking recorder: %v", err)
 		}
 	}()
-	go serveWeb(trackRecorder, opts.mute)
+	if opts.historyDuration > 0 {
+		log.Printf("flight history lookback=%s endpoint=%s", opts.historyDuration, opts.historyURL)
+	}
+	go serveWeb(trackRecorder, opts.mute, flighthistory.NewClient(opts.historyURL), opts.historyDuration)
 
 	if err := run(ctx, opts, trackRecorder); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatalf("flight tracker: %v", err)
@@ -265,8 +279,9 @@ func consume(r io.Reader, opts options, trackRecorder *tracking.Recorder) error 
 	return scanner.Err()
 }
 
-func serveWeb(trackRecorder *tracking.Recorder, mute bool) {
+func serveWeb(trackRecorder *tracking.Recorder, mute bool, historyClient *flighthistory.Client, historyDuration time.Duration) {
 	http.HandleFunc("/aircraft-image", serveAircraftImage)
+	http.Handle("/flight-history", &flightHistoryEndpoint{client: historyClient, lookback: historyDuration})
 	http.Handle("/sight-bell", &sightBellEndpoint{
 		interval: sightBellRateLimit,
 		now:      time.Now,
@@ -311,6 +326,61 @@ func serveWeb(trackRecorder *tracking.Recorder, mute bool) {
 	log.Printf("web map available at http://localhost:8080")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Printf("web server stopped: %v", err)
+	}
+}
+
+type flightHistoryEndpoint struct {
+	client   *flighthistory.Client
+	lookback time.Duration
+}
+
+type flightHistoryResponse struct {
+	LookbackSeconds int64                 `json:"lookbackSeconds"`
+	Points          []flighthistory.Point `json:"points"`
+}
+
+func (endpoint *flightHistoryEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	icao := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("hex")))
+	if len(icao) != 6 {
+		http.Error(w, "invalid aircraft address", http.StatusBadRequest)
+		return
+	}
+	if _, err := hex.DecodeString(icao); err != nil {
+		http.Error(w, "invalid aircraft address", http.StatusBadRequest)
+		return
+	}
+	before, err := time.Parse(time.RFC3339Nano, r.URL.Query().Get("before"))
+	if err != nil || before.IsZero() {
+		http.Error(w, "invalid history end time", http.StatusBadRequest)
+		return
+	}
+
+	points := []flighthistory.Point{}
+	if endpoint.lookback > 0 {
+		if endpoint.client == nil {
+			http.Error(w, "flight history unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		defer cancel()
+		points, err = endpoint.client.Lookup(ctx, icao, before, endpoint.lookback)
+		if err != nil {
+			log.Printf("flight history lookup failed for aircraft=%s before=%s: %v", strings.ToUpper(icao), before.UTC().Format(time.RFC3339), err)
+			http.Error(w, "flight history unavailable", http.StatusBadGateway)
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	response := flightHistoryResponse{LookbackSeconds: int64(endpoint.lookback / time.Second), Points: points}
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("write flight history response for aircraft=%s: %v", strings.ToUpper(icao), err)
 	}
 }
 

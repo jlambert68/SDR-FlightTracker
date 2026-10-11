@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"sdr-flight-tracker/internal/adsb"
+	"sdr-flight-tracker/internal/flighthistory"
 	"sdr-flight-tracker/internal/tracking"
 )
 
@@ -256,6 +257,50 @@ func TestSightBellEndpointValidatesAndRateLimitsRequests(t *testing.T) {
 	endpoint.ServeHTTP(response, request)
 	if response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != http.MethodPost {
 		t.Fatalf("GET alert: status=%d allow=%q", response.Code, response.Header().Get("Allow"))
+	}
+}
+
+func TestFlightHistoryEndpointReturnsConfiguredWindow(t *testing.T) {
+	client := flighthistory.NewClient("https://history.test")
+	client.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if got, want := r.URL.Path, "/globe_history/2026/10/08/traces/10/trace_full_4d2410.json"; got != want {
+			t.Fatalf("history path = %q, want %q", got, want)
+		}
+		body := `{"icao":"4d2410","timestamp":1791486000,"trace":[[450,59.2,18.2,9400,200,90,0,0,null,"adsb_icao",9550]]}`
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+
+	endpoint := &flightHistoryEndpoint{client: client, lookback: 5 * time.Minute}
+	request := httptest.NewRequest(http.MethodGet, "/flight-history?hex=4D2410&before=2026-10-08T19:10:00Z", nil)
+	response := httptest.NewRecorder()
+	endpoint.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
+	}
+	var history flightHistoryResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &history); err != nil {
+		t.Fatal(err)
+	}
+	if history.LookbackSeconds != 300 || len(history.Points) != 1 {
+		t.Fatalf("unexpected history response: %+v", history)
+	}
+	if point := history.Points[0]; point.Latitude != 59.2 || point.Longitude != 18.2 || point.AltitudeFeet != 9400 {
+		t.Fatalf("unexpected history point: %+v", point)
+	}
+}
+
+func TestFlightHistoryEndpointValidatesRequest(t *testing.T) {
+	endpoint := &flightHistoryEndpoint{lookback: 5 * time.Minute}
+	for _, target := range []string{
+		"/flight-history?hex=invalid&before=2026-10-08T19:10:00Z",
+		"/flight-history?hex=4D2410&before=not-a-time",
+	} {
+		request := httptest.NewRequest(http.MethodGet, target, nil)
+		response := httptest.NewRecorder()
+		endpoint.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want %d", target, response.Code, http.StatusBadRequest)
+		}
 	}
 }
 
