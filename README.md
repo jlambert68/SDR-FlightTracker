@@ -44,6 +44,8 @@ serves the map and pushes the current aircraft list over Server-Sent Events.
 Use the `Tottkällevägen 4A` button in the upper-right corner to return the
 camera to the configured receiver position. This address is the default home
 position; override it for another receiver site with `-lat` and `-lon`.
+Drag with the left mouse button to turn the camera in place; the horizon stays
+level while turning. Hold Shift while dragging to orbit around the globe instead.
 Stockholm Arlanda and Stockholm Bromma are marked at their airport reference
 points with a ground marker and a vertical line to a labeled 5,000 ft marker.
 The purple Home sight volume is configured in `web/sight-config.json`. Its four
@@ -58,15 +60,30 @@ west-facing starting point; set them to the measured limits of the real view.
 While at least one current aircraft position is inside those horizontal,
 vertical, and range limits, the map requests a bell every five seconds and the
 panel shows the number of aircraft inside. The bell stops as soon as no current
-position is inside or the live map connection closes.
+position is inside or the live map connection closes. **Test bell** plays the
+same desktop sound used for aircraft alerts; browser audio remains available as
+a fallback if the desktop sound request fails.
 Aircraft with decoded CPR coordinates are shown at their received position;
 aircraft without a position remain visible in the aircraft list. Click an
-aircraft marker for its readable metadata and telemetry.
-When a positioned aircraft first appears, the map retrieves the preceding five
-minutes of its ADSB.lol trace and draws it in brown. The brown history ends at
-the exact first position decoded by this receiver, where the red live track
-begins. Set `-history-duration` to another Go duration such as `10m`, or to `0`
-to disable online history.
+aircraft marker for its readable metadata and telemetry. Between received
+positions, amber dots show a five-second extrapolation from the last received
+position using the ground speed and heading captured when that sequence starts.
+Later velocity-only messages cannot turn an active extrapolated path. A new
+received position clears all of that aircraft's extrapolated dots and starts a
+new sequence without moving the received aircraft marker or its red track.
+When a time-matched internet position is at least 500 metres from the active
+extrapolation, the map stops adding amber dots until a new position is received.
+Every position received from the local signal remains marked with a red dot.
+At the first and every later received position, the map refreshes the preceding
+five minutes of the aircraft's ADSB.lol trace and adds new points to the brown
+history already displayed. When that history covers the interval between two
+received positions, it replaces the provisional straight red line between
+them; red fallback lines remain wherever the internet trace has not caught up.
+While the aircraft remains current, the map refreshes its internet trace every
+16 seconds, including positions newer than the latest receiver signal. Those
+updates extend the brown path without moving the received aircraft marker.
+Set `-history-duration` to another Go duration such as `10m`, or to `0` to
+disable online history.
 
 Example output:
 
@@ -88,7 +105,7 @@ Useful options:
 -metadata-url   metadata endpoint base URL
 -routes         look up departure and destination airports (default on)
 -route-url      flight route endpoint base URL
--history-duration  online history before first local position (default: 5m; 0 disables)
+-history-duration  online history window refreshed at each local position (default: 5m; 0 disables)
 -history-url       ADSB.lol-compatible history service URL
 -lat            receiver latitude (otherwise estimated from public IP)
 -lon            receiver longitude (otherwise estimated from public IP)
@@ -114,11 +131,13 @@ show the departure and destination airport names with their IATA and ICAO codes.
 Route information cannot be determined when no callsign has been received.
 Disable these lookups with `-routes=false`.
 
-Flight history is loaded once per newly found, positioned aircraft through the
-Go server, which avoids browser cross-origin restrictions and briefly caches
-the upstream trace for multiple map clients. Current aircraft use ADSB.lol's
-recent trace feed; replayed older data uses the corresponding daily archive
-when it is available. History failures do not interrupt local ADS-B tracking.
+Flight history is refreshed at every newly received position through the Go
+server, which avoids browser cross-origin restrictions and briefly caches the
+upstream trace for multiple map clients. The browser merges each response into
+the history already drawn. Current aircraft use ADSB.lol's recent trace feed;
+replayed older data uses the corresponding daily archive when it is available.
+History failures do not interrupt local ADS-B tracking or remove its fallback
+line.
 
 The receiver position is estimated from `https://ipapi.co/json/` when `-lat`
 and `-lon` are omitted. For accuracy or privacy, provide both coordinates
@@ -163,11 +182,12 @@ altitude, Earth-centered Cartesian coordinates, and the CPR decoding reference
 (global pair, receiver, or previous aircraft position). Set `-tracking-dir` to
 another directory or to an empty string to disable recording.
 
-The application plays `/usr/share/sounds/freedesktop/stereo/bell.oga` for the
-startup and Home sight-volume bells. It tries `pw-play`, `paplay`,
-`canberra-gtk-play`, `gst-play-1.0`, and `ffplay` in order, and falls back to the
-terminal bell if the installed player cannot reach the audio system. ADS-B messages
-distribute aircraft data across several transmissions. The
+The startup bell, Home sight-volume alarm, and **Test bell** button play
+`/usr/share/sounds/freedesktop/stereo/bell.oga`. The server tries `pw-play`,
+`paplay`, `canberra-gtk-play`, `gst-play-1.0`, and `ffplay` in order, and falls
+back to the terminal bell if the installed player cannot reach the audio system.
+The live alarm can also use browser audio as a fallback after a click or key press.
+ADS-B messages distribute aircraft data across several transmissions. The
 application keeps one record per aircraft and carries previously received fields
 forward, so later log lines show the accumulated callsign, altitude, speed,
 heading, and vertical rate. `frames` is the number of valid messages received

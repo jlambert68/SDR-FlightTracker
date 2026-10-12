@@ -98,7 +98,7 @@ func main() {
 	flag.StringVar(&opts.metadataURL, "metadata-url", "https://hexdb.io/api/v1/aircraft", "aircraft metadata service URL")
 	flag.BoolVar(&opts.routes, "routes", true, "look up departure and destination airports online")
 	flag.StringVar(&opts.routeURL, "route-url", "https://api.adsbdb.com/v0/callsign", "flight route service URL")
-	flag.DurationVar(&opts.historyDuration, "history-duration", 5*time.Minute, "online flight history to draw before first local position; 0 disables")
+	flag.DurationVar(&opts.historyDuration, "history-duration", 5*time.Minute, "online flight history window refreshed at each local position; 0 disables")
 	flag.StringVar(&opts.historyURL, "history-url", "https://adsb.lol", "ADSB.lol-compatible flight history service URL")
 	flag.StringVar(&opts.input, "input", "", "read rtl_adsb text from a file, or - for stdin")
 	flag.Float64Var(&opts.latitude, "lat", homeLatitude, "receiver latitude")
@@ -394,6 +394,7 @@ type sightBellEndpoint struct {
 
 type sightBellRequest struct {
 	Aircraft []string `json:"aircraft"`
+	Test     bool     `json:"test,omitempty"`
 }
 
 func (endpoint *sightBellEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -409,7 +410,7 @@ func (endpoint *sightBellEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Requ
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 8*1024)
 	var alert sightBellRequest
-	if err := json.NewDecoder(r.Body).Decode(&alert); err != nil || !validSightBellAircraft(alert.Aircraft) {
+	if err := json.NewDecoder(r.Body).Decode(&alert); err != nil || !validSightBellRequest(alert) {
 		http.Error(w, "invalid sight bell request", http.StatusBadRequest)
 		return
 	}
@@ -425,6 +426,13 @@ func (endpoint *sightBellEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Requ
 	endpoint.mu.Unlock()
 	endpoint.ring()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func validSightBellRequest(alert sightBellRequest) bool {
+	if alert.Test {
+		return len(alert.Aircraft) == 0
+	}
+	return validSightBellAircraft(alert.Aircraft)
 }
 
 func validSightBellAircraft(aircraft []string) bool {

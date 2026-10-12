@@ -106,6 +106,55 @@ func TestUpdateCPRDecodesSingleFramesLocally(t *testing.T) {
 	}
 }
 
+func TestConsumeCapturedFlightPublishesPosition(t *testing.T) {
+	recorder, err := tracking.NewRecorder("")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	flightMu.Lock()
+	previousFlights := liveFlights
+	liveFlights = make(map[string]adsb.Message)
+	flightMu.Unlock()
+	defer func() {
+		flightMu.Lock()
+		liveFlights = previousFlights
+		flightMu.Unlock()
+	}()
+
+	frames := strings.Join([]string{
+		"*8D4D241058371394FB072EDB94B1;",
+		"*8D4D241099081929B86891358A20;",
+		"*8D4D2410990813293840918FE568;",
+		"*8D4D241099880F28D85C919C0C3A;",
+		"*8D4D241099080C283844904214C8;",
+		"*8D4D241099080C27F84C9021681F;",
+		"*8D4D241099080C27F84C9021681F;",
+		"*8D4D2410581F771DDAEE38817423;",
+	}, "\n")
+	opts := options{latitude: homeLatitude, longitude: homeLongitude}
+	if err := consume(strings.NewReader(frames), opts, recorder); err != nil {
+		t.Fatal(err)
+	}
+
+	flightMu.RLock()
+	flight, ok := liveFlights["4D2410"]
+	flightMu.RUnlock()
+	if !ok {
+		t.Fatal("captured aircraft was not published")
+	}
+	if flight.Latitude == nil || flight.Longitude == nil {
+		t.Fatal("captured aircraft was published without a position")
+	}
+	if math.Abs(*flight.Latitude-59.37290954589844) > 1e-9 || math.Abs(*flight.Longitude-18.16827392578125) > 1e-9 {
+		t.Fatalf("unexpected captured position: %.9f, %.9f", *flight.Latitude, *flight.Longitude)
+	}
+	webFlight := toWebAircraft(flight)
+	if !webFlight.PositionReady || webFlight.PositionReference != "local_receiver_even" {
+		t.Fatalf("captured aircraft is not ready for the sight alarm: %+v", webFlight)
+	}
+}
+
 func TestCPRNLNearPoles(t *testing.T) {
 	for latitude, want := range map[float64]int{84.5: 5, 86: 3, 87: 2, 88: 1} {
 		if got := cprNL(latitude); got != want {
@@ -250,6 +299,13 @@ func TestSightBellEndpointValidatesAndRateLimitsRequests(t *testing.T) {
 	}
 	if response := post(`{"aircraft":["invalid"]}`); response.Code != http.StatusBadRequest || rings != 2 {
 		t.Fatalf("invalid alert: status=%d rings=%d", response.Code, rings)
+	}
+	now = now.Add(4 * time.Second)
+	if response := post(`{"test":true}`); response.Code != http.StatusNoContent || rings != 3 {
+		t.Fatalf("test bell: status=%d rings=%d", response.Code, rings)
+	}
+	if response := post(`{"test":true,"aircraft":["4D2410"]}`); response.Code != http.StatusBadRequest || rings != 3 {
+		t.Fatalf("ambiguous test bell: status=%d rings=%d", response.Code, rings)
 	}
 
 	request := httptest.NewRequest(http.MethodGet, "/sight-bell", nil)

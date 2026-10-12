@@ -1,5 +1,5 @@
-// Package flighthistory retrieves recent aircraft traces for display before
-// the first position received by the local SDR.
+// Package flighthistory retrieves recent aircraft traces for display alongside
+// positions received by the local SDR.
 package flighthistory
 
 import (
@@ -43,8 +43,8 @@ type traceSource struct {
 }
 
 // Client retrieves readsb trace files from an ADSB.lol-compatible server.
-// Trace files are briefly cached so several map clients do not repeat the same
-// upstream request when an aircraft first appears.
+// Trace files are briefly cached so position refreshes and multiple map clients
+// do not repeat the same upstream request.
 type Client struct {
 	BaseURL string
 	HTTP    *http.Client
@@ -66,8 +66,8 @@ func NewClient(baseURL string) *Client {
 }
 
 // Lookup returns positions in [before-lookback, before). Points at or after
-// before are excluded so the caller can join the history to its exact first
-// locally received position.
+// before are excluded so the caller can reconcile the trace with locally
+// received positions.
 func (c *Client) Lookup(ctx context.Context, icao string, before time.Time, lookback time.Duration) ([]Point, error) {
 	icao = strings.ToLower(strings.TrimSpace(icao))
 	if !validICAO(icao) {
