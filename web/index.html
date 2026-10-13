@@ -1,1 +1,68 @@
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SDR Flight Tracker</title><link rel="stylesheet" href="https://cesium.com/downloads/cesiumjs/releases/1.126/Build/Cesium/Widgets/widgets.css"><link rel="stylesheet" href="/style.css?v=24"></head><body><div id="cesiumContainer"></div><aside id="aircraftList"><h1>Aircraft <span id="aircraftCount">0</span></h1><div id="aircraftRows"><p class="empty">Waiting for ADS-B messages…</p></div></aside><div id="status">Loading map…</div><aside id="cameraControls"><button id="homeButton" title="Fly to Tottkällevägen 4A">⌂ Tottkällevägen 4A</button><button id="topDownButton" title="Top-down view of Tottkällevägen 4A">⌖ Top-down home</button><label for="heightSlider">Camera height <output id="heightValue">5,000 ft</output></label><input id="heightSlider" type="range" min="1000" max="100000" step="250" value="5000"><div id="cameraInfo"><span>Camera position</span><b id="cameraCoordinates">—</b><span>Horizontal from home</span><b id="horizontalDistance">—</b><span>Vertical from home</span><b id="verticalDistance">—</b></div><details id="sightControls" open><summary>◇ Home sight volume</summary><p>H° bearing from north · V° above horizon</p><p id="sightAlertStatus">Sight bell: waiting for configuration</p><button id="testSightBell" type="button">Test bell</button><label for="sightRange">Beam range <span><input id="sightRange" type="number" min="100" max="200000" step="100"> m</span></label><label for="sightOriginHeight">Origin height <span><input id="sightOriginHeight" type="number" min="-100" max="10000" step="1"> m</span></label><div class="sightBeamHead"><span>Beam</span><span>H°</span><span>V°</span></div><div id="sightBeamControls"></div><button id="resetSightVolume" type="button">Reset sight volume</button></details></aside><script src="https://cesium.com/downloads/cesiumjs/releases/1.126/Build/Cesium/Cesium.js"></script><script src="/projection.js?v=3"></script><script src="/track-history.js?v=2"></script><script src="/app.js?v=35"></script></body></html>
+<!doctype html>
+<html>
+<head>
+ <meta charset="utf-8">
+ <meta name="viewport" content="width=device-width,initial-scale=1">
+ <title>SDR Flight Tracker</title>
+ <link rel="stylesheet" href="https://cesium.com/downloads/cesiumjs/releases/1.126/Build/Cesium/Widgets/widgets.css">
+ <link rel="stylesheet" href="/style.css?v=25">
+</head>
+<body>
+ <div id="cesiumContainer"></div>
+ <aside id="aircraftList">
+  <h1>Aircraft <span id="aircraftCount">0</span></h1>
+  <div id="aircraftRows"><p class="empty">Waiting for ADS-B messages…</p></div>
+ </aside>
+ <aside id="dataModeControls" aria-label="Flight data source">
+  <div class="dataModeButtons" role="group" aria-label="Flight data source">
+   <button id="liveModeButton" class="active" type="button" aria-pressed="true">Live</button>
+   <button id="historyModeButton" type="button" aria-pressed="false">Historical data</button>
+  </div>
+  <div id="historyPlaybackControls" hidden>
+   <label for="historyDate">Date
+    <select id="historyDate" aria-label="Historical data date"></select>
+   </label>
+   <label class="historyTimeLabel" for="historyTime">Date &amp; time
+    <output id="historyTimeValue" for="historyTime">—</output>
+   </label>
+   <input id="historyTime" type="range" min="0" max="0" step="1000" value="0" disabled>
+   <div class="historyPlaybackOptions">
+    <label for="historySpeed">Speed
+     <span><input id="historySpeed" type="number" min="0.1" max="1000" step="0.1" value="1">×</span>
+    </label>
+    <label class="historyAutomatic" for="historyAutomatic">
+     <input id="historyAutomatic" type="checkbox"> Advance automatically
+    </label>
+   </div>
+  </div>
+ </aside>
+ <div id="status">Loading map…</div>
+ <aside id="cameraControls">
+  <button id="homeButton" title="Fly to Tottkällevägen 4A">⌂ Tottkällevägen 4A</button>
+  <button id="topDownButton" title="Top-down view of Tottkällevägen 4A">⌖ Top-down home</button>
+  <label for="heightSlider">Camera height <output id="heightValue">5,000 ft</output></label>
+  <input id="heightSlider" type="range" min="1000" max="100000" step="250" value="5000">
+  <div id="cameraInfo">
+   <span>Camera position</span><b id="cameraCoordinates">—</b>
+   <span>Horizontal from home</span><b id="horizontalDistance">—</b>
+   <span>Vertical from home</span><b id="verticalDistance">—</b>
+  </div>
+  <details id="sightControls" open>
+   <summary>◇ Home sight volume</summary>
+   <p>H° bearing from north · V° above horizon</p>
+   <p id="sightAlertStatus">Sight bell: waiting for configuration</p>
+   <button id="testSightBell" type="button">Test bell</button>
+   <label for="sightRange">Beam range <span><input id="sightRange" type="number" min="100" max="200000" step="100"> m</span></label>
+   <label for="sightOriginHeight">Origin height <span><input id="sightOriginHeight" type="number" min="-100" max="10000" step="1"> m</span></label>
+   <div class="sightBeamHead"><span>Beam</span><span>H°</span><span>V°</span></div>
+   <div id="sightBeamControls"></div>
+   <button id="resetSightVolume" type="button">Reset sight volume</button>
+  </details>
+ </aside>
+ <script src="https://cesium.com/downloads/cesiumjs/releases/1.126/Build/Cesium/Cesium.js"></script>
+ <script src="/projection.js?v=3"></script>
+ <script src="/track-history.js?v=2"></script>
+ <script src="/recorded-history.js?v=1"></script>
+ <script src="/app.js?v=36"></script>
+</body>
+</html>

@@ -148,7 +148,7 @@ func main() {
 	if opts.historyDuration > 0 {
 		log.Printf("flight history lookback=%s endpoint=%s", opts.historyDuration, opts.historyURL)
 	}
-	go serveWeb(trackRecorder, opts.mute, flighthistory.NewClient(opts.historyURL), opts.historyDuration)
+	go serveWeb(trackRecorder, opts.trackingDir, opts.mute, flighthistory.NewClient(opts.historyURL), opts.historyDuration)
 
 	if err := run(ctx, opts, trackRecorder); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatalf("flight tracker: %v", err)
@@ -279,9 +279,10 @@ func consume(r io.Reader, opts options, trackRecorder *tracking.Recorder) error 
 	return scanner.Err()
 }
 
-func serveWeb(trackRecorder *tracking.Recorder, mute bool, historyClient *flighthistory.Client, historyDuration time.Duration) {
+func serveWeb(trackRecorder *tracking.Recorder, trackingDir string, mute bool, historyClient *flighthistory.Client, historyDuration time.Duration) {
 	http.HandleFunc("/aircraft-image", serveAircraftImage)
 	http.Handle("/flight-history", &flightHistoryEndpoint{client: historyClient, lookback: historyDuration})
+	http.Handle("/recorded-history", &recordedHistoryEndpoint{root: trackingDir, latitude: receiverPosition.Latitude, longitude: receiverPosition.Longitude})
 	http.Handle("/sight-bell", &sightBellEndpoint{
 		interval: sightBellRateLimit,
 		now:      time.Now,

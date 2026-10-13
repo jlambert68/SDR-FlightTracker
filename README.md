@@ -41,6 +41,15 @@ go build -o bin/flighttracker ./cmd/flighttracker
 
 Open `http://localhost:8080` to view the live CesiumJS map. The Go process
 serves the map and pushes the current aircraft list over Server-Sent Events.
+Use the data-source panel in the lower-left corner to switch between **Live**
+and **Historical data**. Historical mode lists every UTC date found below the
+configured tracking directory. Select a date, drag the date-and-time slider,
+set a playback multiplier, and enable **Advance automatically** to replay the
+saved timeline. Changing modes or dates clears aircraft, paths, and flight
+details while leaving the camera in its current position. Playback does not
+write map-position records or sound the sight alarm. Each replayed position
+requests the same preceding internet trace window used by the live map, using
+the saved timestamp so archived ADSB.lol data appears as the brown track.
 Use the `Tottkällevägen 4A` button in the upper-right corner to return the
 camera to the configured receiver position. This address is the default home
 position; override it for another receiver site with `-lat` and `-lon`.
@@ -135,7 +144,8 @@ Flight history is refreshed at every newly received position through the Go
 server, which avoids browser cross-origin restrictions and briefly caches the
 upstream trace for multiple map clients. The browser merges each response into
 the history already drawn. Current aircraft use ADSB.lol's recent trace feed;
-replayed older data uses the corresponding daily archive when it is available.
+historical playback and live receiver data carrying older timestamps use the
+corresponding daily archive when it is available.
 History failures do not interrupt local ADS-B tracking or remove its fallback
 line.
 
@@ -181,6 +191,13 @@ world. They contain the browser timestamp and session ID, latitude, longitude,
 altitude, Earth-centered Cartesian coordinates, and the CPR decoding reference
 (global pair, receiver, or previous aircraft position). Set `-tracking-dir` to
 another directory or to an empty string to disable recording.
+The historical playback endpoint reads these files directly. It combines all
+aircraft files for the selected date, orders their records by reception time,
+and reconstructs each aircraft's latest saved telemetry and accepted position.
+For legacy records without a stored position, it replays the saved raw frame
+through the current decoder using the configured receiver position.
+Aircraft disappear from a replay after the same five-minute inactivity window
+used by the live map.
 
 The startup bell, Home sight-volume alarm, and **Test bell** button play
 `/usr/share/sounds/freedesktop/stereo/bell.oga`. The server tries `pw-play`,
