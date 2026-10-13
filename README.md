@@ -50,6 +50,10 @@ details while leaving the camera in its current position. Playback does not
 write map-position records or sound the sight alarm. Each replayed position
 requests the same preceding internet trace window used by the live map, using
 the saved timestamp so archived ADSB.lol data appears as the brown track.
+If the selected RTL-SDR receiver is not connected or cannot be opened, the
+server stays running in recorded-history-only mode. The browser opens
+**Historical data** automatically and hides **Live**; restart the application
+after making the receiver available to restore live tracking.
 Use the `Tottkällevägen 4A` button in the upper-right corner to return the
 camera to the configured receiver position. This address is the default home
 position; override it for another receiver site with `-lat` and `-lon`.

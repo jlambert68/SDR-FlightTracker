@@ -155,6 +155,21 @@ func TestConsumeCapturedFlightPublishesPosition(t *testing.T) {
 	}
 }
 
+func TestRTLSDRUnavailableRecognizesDecoderStartupFailures(t *testing.T) {
+	for _, output := range []string{
+		"No supported devices found.\n",
+		"Found 1 device(s):\nNo matching devices found.\n",
+		"usb_claim_interface error -6\nFailed to open rtlsdr device #0.\n",
+	} {
+		if !rtlSDRUnavailable(output) {
+			t.Errorf("startup output was not recognized as unavailable: %q", output)
+		}
+	}
+	if rtlSDRUnavailable("Allocating 15 zero-copy buffers\n") {
+		t.Fatal("normal decoder output was recognized as unavailable")
+	}
+}
+
 func TestCPRNLNearPoles(t *testing.T) {
 	for latitude, want := range map[float64]int{84.5: 5, 86: 3, 87: 2, 88: 1} {
 		if got := cprNL(latitude); got != want {

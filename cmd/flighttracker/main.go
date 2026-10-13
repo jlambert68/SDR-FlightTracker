@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -46,6 +47,9 @@ const unknownGroundSpeedLimitKnots = 600.0
 const positionErrorAllowanceMeters = 250.0
 const localCPRReferenceRangeMeters = 180 * 1_852.0
 const aircraftPhotoUserAgent = "SDR-FlightTracker/1.0 (+https://github.com/jlambert68/SDR-FlightTracker)"
+const rtlADSBErrorCaptureLimit = 8 * 1024
+
+var errRTLSDRUnavailable = errors.New("RTL-SDR receiver unavailable")
 
 var soundLookup sync.Once
 var soundFailureLog sync.Once
@@ -83,6 +87,40 @@ type options struct {
 type bellCommand struct {
 	path string
 	args []string
+}
+
+type liveModeState struct {
+	mu        sync.RWMutex
+	available bool
+}
+
+func (state *liveModeState) Available() bool {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	return state.available
+}
+
+func (state *liveModeState) SetAvailable(available bool) {
+	state.mu.Lock()
+	state.available = available
+	state.mu.Unlock()
+}
+
+type cappedBuffer struct {
+	bytes.Buffer
+	limit int
+}
+
+func (buffer *cappedBuffer) Write(data []byte) (int, error) {
+	written := len(data)
+	remaining := buffer.limit - buffer.Len()
+	if remaining > 0 {
+		if len(data) > remaining {
+			data = data[:remaining]
+		}
+		_, _ = buffer.Buffer.Write(data)
+	}
+	return written, nil
 }
 
 func main() {
@@ -148,9 +186,16 @@ func main() {
 	if opts.historyDuration > 0 {
 		log.Printf("flight history lookback=%s endpoint=%s", opts.historyDuration, opts.historyURL)
 	}
-	go serveWeb(trackRecorder, opts.trackingDir, opts.mute, flighthistory.NewClient(opts.historyURL), opts.historyDuration)
+	liveMode := &liveModeState{available: true}
+	go serveWeb(trackRecorder, opts.trackingDir, opts.mute, flighthistory.NewClient(opts.historyURL), opts.historyDuration, liveMode)
 
 	if err := run(ctx, opts, trackRecorder); err != nil && !errors.Is(err, context.Canceled) {
+		if errors.Is(err, errRTLSDRUnavailable) {
+			liveMode.SetAvailable(false)
+			log.Printf("%v; continuing in recorded-history-only mode", err)
+			<-ctx.Done()
+			return
+		}
 		log.Fatalf("flight tracker: %v", err)
 	}
 }
@@ -189,7 +234,8 @@ func run(ctx context.Context, opts options, trackRecorder *tracking.Recorder) er
 	if err != nil {
 		return err
 	}
-	cmd.Stderr = os.Stderr
+	decoderErrors := &cappedBuffer{limit: rtlADSBErrorCaptureLimit}
+	cmd.Stderr = io.MultiWriter(os.Stderr, decoderErrors)
 	log.Printf("listening for ADS-B on 1090 MHz with RTL-SDR device %s", opts.device)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("could not start rtl_adsb; check USB permissions and that the dongle is connected: %w", err)
@@ -203,9 +249,26 @@ func run(ctx context.Context, opts options, trackRecorder *tracking.Recorder) er
 		return fmt.Errorf("could not read rtl_adsb output: %w", scanErr)
 	}
 	if waitErr != nil {
+		if rtlSDRUnavailable(decoderErrors.String()) {
+			return fmt.Errorf("%w for device %s", errRTLSDRUnavailable, opts.device)
+		}
 		return fmt.Errorf("rtl_adsb stopped; the dongle may be unavailable or claimed by another driver: %w", waitErr)
 	}
 	return waitErr
+}
+
+func rtlSDRUnavailable(stderr string) bool {
+	message := strings.ToLower(stderr)
+	for _, unavailable := range []string{
+		"no supported devices found",
+		"no matching devices found",
+		"failed to open rtlsdr device",
+	} {
+		if strings.Contains(message, unavailable) {
+			return true
+		}
+	}
+	return false
 }
 
 func consume(r io.Reader, opts options, trackRecorder *tracking.Recorder) error {
@@ -279,7 +342,7 @@ func consume(r io.Reader, opts options, trackRecorder *tracking.Recorder) error 
 	return scanner.Err()
 }
 
-func serveWeb(trackRecorder *tracking.Recorder, trackingDir string, mute bool, historyClient *flighthistory.Client, historyDuration time.Duration) {
+func serveWeb(trackRecorder *tracking.Recorder, trackingDir string, mute bool, historyClient *flighthistory.Client, historyDuration time.Duration, liveMode *liveModeState) {
 	http.HandleFunc("/aircraft-image", serveAircraftImage)
 	http.Handle("/flight-history", &flightHistoryEndpoint{client: historyClient, lookback: historyDuration})
 	http.Handle("/recorded-history", &recordedHistoryEndpoint{root: trackingDir, latitude: receiverPosition.Latitude, longitude: receiverPosition.Longitude})
@@ -312,7 +375,7 @@ func serveWeb(trackRecorder *tracking.Recorder, trackingDir string, mute bool, h
 			for _, flight := range liveFlights {
 				aircraftList = append(aircraftList, toWebAircraft(flight))
 			}
-			payload := map[string]any{"receiver": receiverPosition, "aircraft": aircraftList, "soundMuted": mute}
+			payload := map[string]any{"receiver": receiverPosition, "aircraft": aircraftList, "soundMuted": mute, "liveAvailable": liveMode.Available()}
 			data, _ := json.Marshal(payload)
 			flightMu.Unlock()
 			fmt.Fprintf(w, "data: %s\n\n", data)
